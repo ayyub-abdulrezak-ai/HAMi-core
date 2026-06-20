@@ -36,6 +36,16 @@ int cuda_to_nvml_map_array[CUDA_DEVICE_MAX_COUNT];
 static int cached_sm_limit[CUDA_DEVICE_MAX_COUNT] = {0};
 static int cached_util_switch = 0;
 
+/* Time-based throttle state — forward declared here, defined below */
+typedef struct { CUevent start; CUevent end; } tbt_pair_t;
+static tbt_pair_t *tbt_pairs[CUDA_DEVICE_MAX_COUNT];
+static int         tbt_count[CUDA_DEVICE_MAX_COUNT];
+static int         tbt_cap[CUDA_DEVICE_MAX_COUNT];
+static tbt_pair_t  tbt_pending[CUDA_DEVICE_MAX_COUNT];
+static int         tbt_dev_ready[CUDA_DEVICE_MAX_COUNT];
+static int64_t     tbt_stall_count[CUDA_DEVICE_MAX_COUNT];
+static int64_t     tbt_debited_ns[CUDA_DEVICE_MAX_COUNT];
+
 void rate_limiter(int grids, int blocks) {
   CUdevice current_device;
   CUresult res = cuCtxGetDevice(&current_device);
@@ -240,14 +250,28 @@ void* utilization_watcher() {
                 continue;
             }
 
-            if ((share[dev] == g_total_cuda_cores[dev]) && (g_cur_cuda_cores[dev] < 0)) {
-              g_total_cuda_cores[dev] *= 2;
-              share[dev] = g_total_cuda_cores[dev];
-            }
+            if (get_time_based_throttle()) {
+              int64_t tick_ns = g_wait.tv_nsec;
+              int64_t grant = (int64_t)(cached_sm_limit[dev] / 100.0 * tick_ns);
+              change_token(grant, dev);
+              int64_t debited = tbt_debited_ns[dev];
+              int64_t stalls  = tbt_stall_count[dev];
+              tbt_debited_ns[dev] = 0;
+              tbt_stall_count[dev] = 0;
+              int util_pct = grant > 0 ? (int)(debited * 100 / grant) : 0;
+              LOG_INFO("device %d: [time-based] limit=%d%% grant=%ldns debited=%ldns util=%d%% bucket=%ldns pending=%d stalls=%ld\n",
+                       dev, cached_sm_limit[dev], grant, debited, util_pct,
+                       g_cur_cuda_cores[dev], tbt_count[dev], stalls);
+            } else {
+              if ((share[dev] == g_total_cuda_cores[dev]) && (g_cur_cuda_cores[dev] < 0)) {
+                g_total_cuda_cores[dev] *= 2;
+                share[dev] = g_total_cuda_cores[dev];
+              }
 
-            if ((userutil[dev] <= 100) && (userutil[dev] >= 0)) {
-              share[dev] = delta(cached_sm_limit[dev], userutil[dev], share[dev], dev);
-              change_token(share[dev], dev);
+              if ((userutil[dev] <= 100) && (userutil[dev] >= 0)) {
+                share[dev] = delta(cached_sm_limit[dev], userutil[dev], share[dev], dev);
+                change_token(share[dev], dev);
+              }
             }
 
             LOG_INFO("device %d: userutil=%d currentcores=%ld total=%ld limit=%d share=%ld\n",
@@ -276,10 +300,85 @@ void init_utilization_watcher() {
         }
     }
 
+    LOG_MSG("throttle mode: %s", get_time_based_throttle() ? "time-based (experimental)" : "NVML-feedback");
+
     pthread_t tid;
     if (has_limit) {
         pthread_create(&tid, NULL, utilization_watcher, NULL);
     }
     return;
+}
+
+
+static void tbt_init_device(int device_id) {
+    if (tbt_dev_ready[device_id]) return;
+    // Skip if no limit — watcher won't grant tokens at 100%, which would deadlock the stall loop
+    if (cached_sm_limit[device_id] <= 0 || cached_sm_limit[device_id] >= 100) {
+        tbt_dev_ready[device_id] = 1;
+        return;
+    }
+    // Cap bucket at one tick period so idle processes don't accumulate burst credit
+    g_total_cuda_cores[device_id] = g_wait.tv_nsec;
+    g_cur_cuda_cores[device_id] = 0;
+    tbt_pairs[device_id] = NULL;
+    tbt_count[device_id] = 0;
+    tbt_cap[device_id] = 0;
+    tbt_dev_ready[device_id] = 1;
+}
+
+static void tbt_drain(int device_id) {
+    int drained = 0;
+    while (drained < tbt_count[device_id]) {
+        tbt_pair_t *pair = &tbt_pairs[device_id][drained];
+        if (cuEventQuery(pair->end) != CUDA_SUCCESS)
+            break;
+        float ms = 0.0f;
+        cuEventElapsedTime(&ms, pair->start, pair->end);
+        int64_t ns = (int64_t)(ms * 1e6f);
+        tbt_debited_ns[device_id] += ns;
+        int64_t before, after;
+        do {
+            before = g_cur_cuda_cores[device_id];
+            after = before - ns;
+        } while (!CAS(&g_cur_cuda_cores[device_id], before, after));
+        cuEventDestroy(pair->start);
+        cuEventDestroy(pair->end);
+        drained++;
+    }
+    if (drained > 0) {
+        tbt_count[device_id] -= drained;
+        memmove(tbt_pairs[device_id], tbt_pairs[device_id] + drained,
+                tbt_count[device_id] * sizeof(tbt_pair_t));
+    }
+}
+
+static void tbt_push(int device_id, tbt_pair_t pair) {
+    if (tbt_count[device_id] == tbt_cap[device_id]) {
+        int new_cap = tbt_cap[device_id] == 0 ? 8 : tbt_cap[device_id] * 2;
+        tbt_pairs[device_id] = (tbt_pair_t *)realloc(tbt_pairs[device_id],
+                                                      new_cap * sizeof(tbt_pair_t));
+        tbt_cap[device_id] = new_cap;
+    }
+    tbt_pairs[device_id][tbt_count[device_id]++] = pair;
+}
+
+void time_throttle_pre_launch(CUstream hStream, int device_id) {
+    tbt_init_device(device_id);
+    // Drain completed events and stall until budget is non-negative
+    do {
+        tbt_drain(device_id);
+        if (g_cur_cuda_cores[device_id] >= 0) break;
+        tbt_stall_count[device_id]++;
+        nanosleep(&g_cycle, NULL);
+    } while (1);
+    // Create events and record start for this kernel
+    cuEventCreate(&tbt_pending[device_id].start, CU_EVENT_DEFAULT);
+    cuEventCreate(&tbt_pending[device_id].end, CU_EVENT_DEFAULT);
+    cuEventRecord(tbt_pending[device_id].start, hStream);
+}
+
+void time_throttle_post_launch(CUstream hStream, int device_id) {
+    cuEventRecord(tbt_pending[device_id].end, hStream);
+    tbt_push(device_id, tbt_pending[device_id]);
 }
 

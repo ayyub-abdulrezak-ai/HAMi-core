@@ -1052,6 +1052,14 @@ int set_env_utilization_switch() {
     return 0;
 }
 
+int get_time_based_throttle() {
+    static int cached = -1;
+    if (cached != -1) return cached;
+    const char *env = getenv("TIME_BASED_THROTTLE");
+    cached = (env != NULL && strcmp(env, "true") == 0) ? 1 : 0;
+    return cached;
+}
+
 void try_create_shrreg() {
     LOG_DEBUG("Try create shrreg")
     if (region_info.fd == -1) {

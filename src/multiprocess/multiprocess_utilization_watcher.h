@@ -21,3 +21,6 @@ void rate_limiter(int grids, int blocks);
 void init_utilization_watcher();
 void* utilization_watcher();
 int setspec();
+
+void time_throttle_pre_launch(CUstream hStream, int device_id);
+void time_throttle_post_launch(CUstream hStream, int device_id);
