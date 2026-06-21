@@ -1,0 +1,4 @@
+[
+  { "label": "50/30/20%",    "limits": [50, 30, 20],     "modes": ["time-based"], "duration": 15 },
+  { "label": "10/10/10/10%", "limits": [10, 10, 10, 10], "modes": ["time-based"], "duration": 15 }
+]

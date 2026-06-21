@@ -36,20 +36,26 @@ int cuda_to_nvml_map_array[CUDA_DEVICE_MAX_COUNT];
 static int cached_sm_limit[CUDA_DEVICE_MAX_COUNT] = {0};
 static int cached_util_switch = 0;
 
-/* Time-based throttle state — forward declared here, defined below */
-typedef struct { CUevent start; CUevent end; } tbt_pair_t;
-static tbt_pair_t *tbt_pairs[CUDA_DEVICE_MAX_COUNT];
-static int         tbt_count[CUDA_DEVICE_MAX_COUNT];
-static int         tbt_cap[CUDA_DEVICE_MAX_COUNT];
-static tbt_pair_t  tbt_pending[CUDA_DEVICE_MAX_COUNT];
-static int         tbt_dev_ready[CUDA_DEVICE_MAX_COUNT];
-static int64_t     tbt_stall_count[CUDA_DEVICE_MAX_COUNT];
-static int64_t     tbt_debited_ns[CUDA_DEVICE_MAX_COUNT];
-// Number of competing CUDA processes on this device, updated each watcher tick.
-// cuEventElapsedTime is inflated by N under multi-process time-slicing because
-// other processes' kernels run between our start event and our kernel executing.
-// Dividing burst_ns by N recovers the true per-process GPU compute time.
-static volatile int tbt_process_count[CUDA_DEVICE_MAX_COUNT];
+/* Time-based throttle state.
+ *
+ * Algorithm: integral controller with forgetting factor (EMA).
+ *
+ * At each sync (cudaDeviceSynchronize / cuStreamSynchronize):
+ *   burst_ns   = wall-clock time since last stall ended
+ *   active_frac = burst_ns / (burst_ns + last_stall_ns)   [CPU-side, no GPU measurement]
+ *   avg_gpu_frac = EMA(active_frac, gamma=0.95)
+ *   computed_stall = burst_ns * (avg_gpu_frac - limit) / limit   if avg_gpu_frac > limit
+ *
+ */
+#define TBT_GAMMA 0.95
+
+static int             tbt_dev_ready[CUDA_DEVICE_MAX_COUNT];
+static int             tbt_stall_count[CUDA_DEVICE_MAX_COUNT];
+static volatile int    tbt_process_count[CUDA_DEVICE_MAX_COUNT];
+static double          tbt_total_gpu[CUDA_DEVICE_MAX_COUNT];    // EMA numerator
+static double          tbt_total_wall[CUDA_DEVICE_MAX_COUNT];   // EMA denominator
+static double          tbt_avg_gpu_frac[CUDA_DEVICE_MAX_COUNT]; // cached ratio
+static struct timespec tbt_burst_start[CUDA_DEVICE_MAX_COUNT];  // when last stall ended
 
 void rate_limiter(int grids, int blocks) {
   CUdevice current_device;
@@ -290,28 +296,23 @@ void* utilization_watcher() {
             }
 
             if (get_time_based_throttle()) {
-              // Update competing process count for N-correction of cuEventElapsedTime.
-              unsigned int nprocs = 0;
-              nvmlDevice_t nvml_dev;
-              if (nvmlDeviceGetHandleByIndex(dev, &nvml_dev) == NVML_SUCCESS) {
-                  nvmlProcessInfo_v1_t procs[SHARED_REGION_MAX_PROCESS_NUM];
-                  unsigned int cnt = SHARED_REGION_MAX_PROCESS_NUM;
-                  if (nvmlDeviceGetComputeRunningProcesses(nvml_dev, &cnt, procs) == NVML_SUCCESS)
-                      nprocs = cnt;
+              // Update EMA of our GPU fraction using NVML smUtil.
+              // userutil[dev] = my_smutil (our process's GPU %, set in get_used_gpu_utilization).
+              // Only update when NVML has a fresh reading (userutil >= 0).
+              if (userutil[dev] >= 0) {
+                  double tick_s = tick.tv_nsec / 1e9;
+                  tbt_total_gpu[dev]  = TBT_GAMMA * tbt_total_gpu[dev]
+                                      + (userutil[dev] / 100.0) * tick_s;
+                  tbt_total_wall[dev] = TBT_GAMMA * tbt_total_wall[dev] + tick_s;
+                  if (tbt_total_wall[dev] > 0)
+                      tbt_avg_gpu_frac[dev] = tbt_total_gpu[dev] / tbt_total_wall[dev];
               }
-              tbt_process_count[dev] = (nprocs > 0) ? (int)nprocs : 1;
 
-              int64_t tick_ns = tick.tv_nsec;
-              int64_t grant = (int64_t)(cached_sm_limit[dev] / 100.0 * tick_ns);
-              change_token(grant, dev);
-              int64_t debited = tbt_debited_ns[dev];
-              int64_t stalls  = tbt_stall_count[dev];
-              tbt_debited_ns[dev] = 0;
+              int stalls = tbt_stall_count[dev];
               tbt_stall_count[dev] = 0;
-              int util_pct = grant > 0 ? (int)(debited * 100 / grant) : 0;
-              LOG_INFO("device %d: [time-based] limit=%d%% grant=%ldns debited=%ldns util=%d%% bucket=%ldns pending=%d stalls=%ld n_procs=%d\n",
-                       dev, cached_sm_limit[dev], grant, debited, util_pct,
-                       g_cur_cuda_cores[dev], tbt_count[dev], stalls, tbt_process_count[dev]);
+              LOG_INFO("device %d: [time-based] limit=%d%% avg_gpu=%.1f%% syncs=%d n_procs=%d\n",
+                       dev, cached_sm_limit[dev], tbt_avg_gpu_frac[dev] * 100.0,
+                       stalls, tbt_process_count[dev]);
             } else {
               if ((share[dev] == g_total_cuda_cores[dev]) && (g_cur_cuda_cores[dev] < 0)) {
                 g_total_cuda_cores[dev] *= 2;
@@ -369,130 +370,77 @@ void init_utilization_watcher() {
 
 static void tbt_init_device(int device_id) {
     if (tbt_dev_ready[device_id]) return;
-    // Skip if no limit — watcher won't grant tokens at 100%, which would deadlock the stall loop
     if (cached_sm_limit[device_id] <= 0 || cached_sm_limit[device_id] >= 100) {
         tbt_dev_ready[device_id] = 1;
         return;
     }
-    // Cap bucket at one grant (limit% × tick) so idle processes can't accumulate
-    // more credit than they'd earn in one tick.  Capping at the full tick allows
-    // a process to run ahead of its limit before stalling, causing proportional bias.
-    g_total_cuda_cores[device_id] = (int64_t)(cached_sm_limit[device_id] / 100.0 * g_wait.tv_nsec);
-    g_cur_cuda_cores[device_id] = 0;
-    tbt_pairs[device_id] = NULL;
-    tbt_count[device_id] = 0;
-    tbt_cap[device_id] = 0;
+    // Warmstart: assume we've been running at exactly our limit.
+    double limit_frac = cached_sm_limit[device_id] / 100.0;
+    tbt_total_gpu[device_id]     = limit_frac;
+    tbt_total_wall[device_id]    = 1.0;
+    tbt_avg_gpu_frac[device_id]  = limit_frac;
+    tbt_stall_count[device_id]   = 0;
     tbt_process_count[device_id] = 1;
+    clock_gettime(CLOCK_MONOTONIC, &tbt_burst_start[device_id]);
     tbt_dev_ready[device_id] = 1;
-}
-
-// Drain all completed events, returning total GPU execution time in nanoseconds.
-// Does not touch the token bucket — caller is responsible for debiting.
-static int64_t tbt_drain(int device_id) {
-    int64_t burst_ns = 0;
-    int drained = 0;
-    while (drained < tbt_count[device_id]) {
-        tbt_pair_t *pair = &tbt_pairs[device_id][drained];
-        if (cuEventQuery(pair->end) != CUDA_SUCCESS)
-            break;
-        float ms = 0.0f;
-        cuEventElapsedTime(&ms, pair->start, pair->end);
-        burst_ns += (int64_t)(ms * 1e6f);
-        cuEventDestroy(pair->start);
-        cuEventDestroy(pair->end);
-        drained++;
-    }
-    if (drained > 0) {
-        tbt_count[device_id] -= drained;
-        memmove(tbt_pairs[device_id], tbt_pairs[device_id] + drained,
-                tbt_count[device_id] * sizeof(tbt_pair_t));
-    }
-    return burst_ns;
-}
-
-static void tbt_push(int device_id, tbt_pair_t pair) {
-    if (tbt_count[device_id] == tbt_cap[device_id]) {
-        int new_cap = tbt_cap[device_id] == 0 ? 8 : tbt_cap[device_id] * 2;
-        tbt_pairs[device_id] = (tbt_pair_t *)realloc(tbt_pairs[device_id],
-                                                      new_cap * sizeof(tbt_pair_t));
-        tbt_cap[device_id] = new_cap;
-    }
-    tbt_pairs[device_id][tbt_count[device_id]++] = pair;
 }
 
 void time_throttle_pre_launch(CUstream hStream, int device_id) {
     tbt_init_device(device_id);
-
-    // cuEventElapsedTime is inflated by 1/limit_frac because our kernels spend
-    // idle_frac of their elapsed time waiting for other processes.  Multiplying
-    // by limit_frac deflates to true GPU compute; idle_frac then gives the
-    // stall debt that enforces the limit:
-    //   debit = burst × limit_frac × idle_frac
-    double limit_frac = cached_sm_limit[device_id] / 100.0;
-    double idle_frac  = 1.0 - limit_frac;
-    int64_t burst_ns = tbt_drain(device_id);
-    if (burst_ns > 0) {
-        int64_t debit = (int64_t)(burst_ns * limit_frac * idle_frac);
-        tbt_debited_ns[device_id] += debit;
-        LOG_INFO("device %d: [tbt pre_launch] burst=%ldns debit=%ldns bucket_before=%ldns\n",
-                 device_id, burst_ns, debit, g_cur_cuda_cores[device_id]);
-        int64_t before, after;
-        do {
-            before = g_cur_cuda_cores[device_id];
-            after  = before - debit;
-        } while (!CAS(&g_cur_cuda_cores[device_id], before, after));
-    }
-
-    // Stall before submitting the next kernel if the bucket is negative.
-    // Drain on each sleep so events are accounted for while fresh — stale
-    // pending events have inflated elapsed times and must be drained promptly.
-    while (g_cur_cuda_cores[device_id] < 0) {
-        tbt_stall_count[device_id]++;
-        nanosleep(&g_cycle, NULL);
-        int64_t stall_burst = tbt_drain(device_id);
-        if (stall_burst > 0) {
-            int64_t stall_debit = (int64_t)(stall_burst * limit_frac * idle_frac);
-            tbt_debited_ns[device_id] += stall_debit;
-            LOG_INFO("device %d: [tbt stall drain] burst=%ldns debit=%ldns bucket_before=%ldns\n",
-                     device_id, stall_burst, stall_debit, g_cur_cuda_cores[device_id]);
-            int64_t before, after;
-            do {
-                before = g_cur_cuda_cores[device_id];
-                after  = before - stall_debit;
-            } while (!CAS(&g_cur_cuda_cores[device_id], before, after));
-        }
-    }
-
-    cuEventCreate(&tbt_pending[device_id].start, CU_EVENT_DEFAULT);
-    cuEventCreate(&tbt_pending[device_id].end, CU_EVENT_DEFAULT);
-    cuEventRecord(tbt_pending[device_id].start, hStream);
 }
 
 void time_throttle_post_launch(CUstream hStream, int device_id) {
-    cuEventRecord(tbt_pending[device_id].end, hStream);
-    tbt_push(device_id, tbt_pending[device_id]);
+    // No-op — throttling happens at sync boundaries.
 }
 
 void time_throttle_sync(int device_id) {
     if (!tbt_dev_ready[device_id]) return;
     if (cached_sm_limit[device_id] <= 0 || cached_sm_limit[device_id] >= 100) return;
 
-    // Drain and debit any events that completed during this sync.
-    // Same corrected formula: burst × limit_frac × idle_frac.
-    int64_t burst_ns = tbt_drain(device_id);
-    if (burst_ns == 0) return;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
 
-    double limit_frac = cached_sm_limit[device_id] / 100.0;
-    double idle_frac  = 1.0 - limit_frac;
-    int64_t debit = (int64_t)(burst_ns * limit_frac * idle_frac);
-    tbt_debited_ns[device_id] += debit;
-    LOG_INFO("device %d: [tbt sync] burst=%ldns debit=%ldns bucket_before=%ldns\n",
-             device_id, burst_ns, debit, g_cur_cuda_cores[device_id]);
+    int64_t burst_ns = (now.tv_sec  - tbt_burst_start[device_id].tv_sec)  * 1000000000LL
+                     + (now.tv_nsec - tbt_burst_start[device_id].tv_nsec);
 
-    int64_t before, after;
-    do {
-        before = g_cur_cuda_cores[device_id];
-        after  = before - debit;
-    } while (!CAS(&g_cur_cuda_cores[device_id], before, after));
+    if (burst_ns <= 0) {
+        tbt_burst_start[device_id] = now;
+        return;
+    }
+
+    double limit_frac   = cached_sm_limit[device_id] / 100.0;
+    double avg_gpu_frac = tbt_avg_gpu_frac[device_id];
+
+    int64_t stall_ns = 0;
+    if (avg_gpu_frac > limit_frac) {
+        stall_ns = (int64_t)(burst_ns * (avg_gpu_frac - limit_frac) / limit_frac);
+        tbt_stall_count[device_id]++;
+    }
+
+    LOG_INFO("device %d: [tbt sync] burst=%ldns stall=%ldns avg_gpu=%.1f%% limit=%d%%\n",
+             device_id, burst_ns, stall_ns, avg_gpu_frac * 100.0,
+             cached_sm_limit[device_id]);
+
+    if (stall_ns > 0) {
+        struct timespec stall_ts = {
+            .tv_sec  = stall_ns / 1000000000LL,
+            .tv_nsec = stall_ns % 1000000000LL,
+        };
+        nanosleep(&stall_ts, NULL);
+    }
+
+    // Update EMA using CPU-side active fraction: burst / (burst + stall).
+    int64_t cycle_ns = burst_ns + stall_ns;
+    double active_frac = (double)burst_ns / (double)cycle_ns;
+
+    tbt_total_gpu[device_id]  = TBT_GAMMA * tbt_total_gpu[device_id]  + active_frac;
+    tbt_total_wall[device_id] = TBT_GAMMA * tbt_total_wall[device_id] + 1.0;
+    tbt_avg_gpu_frac[device_id] = tbt_total_gpu[device_id] / tbt_total_wall[device_id];
+
+    LOG_INFO("device %d: [tbt ema] burst=%ldns stall=%ldns active_frac=%.1f%% avg_gpu=%.1f%% limit=%d%%\n",
+             device_id, burst_ns, stall_ns, active_frac * 100.0,
+             tbt_avg_gpu_frac[device_id] * 100.0, cached_sm_limit[device_id]);
+
+    clock_gettime(CLOCK_MONOTONIC, &tbt_burst_start[device_id]);
 }
 
