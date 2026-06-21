@@ -326,7 +326,10 @@ static void tbt_init_device(int device_id) {
     tbt_dev_ready[device_id] = 1;
 }
 
-static void tbt_drain(int device_id) {
+// Drain all completed events, returning total GPU execution time in nanoseconds.
+// Does not touch the token bucket — caller is responsible for debiting.
+static int64_t tbt_drain(int device_id) {
+    int64_t burst_ns = 0;
     int drained = 0;
     while (drained < tbt_count[device_id]) {
         tbt_pair_t *pair = &tbt_pairs[device_id][drained];
@@ -334,13 +337,7 @@ static void tbt_drain(int device_id) {
             break;
         float ms = 0.0f;
         cuEventElapsedTime(&ms, pair->start, pair->end);
-        int64_t ns = (int64_t)(ms * 1e6f);
-        tbt_debited_ns[device_id] += ns;
-        int64_t before, after;
-        do {
-            before = g_cur_cuda_cores[device_id];
-            after = before - ns;
-        } while (!CAS(&g_cur_cuda_cores[device_id], before, after));
+        burst_ns += (int64_t)(ms * 1e6f);
         cuEventDestroy(pair->start);
         cuEventDestroy(pair->end);
         drained++;
@@ -350,6 +347,7 @@ static void tbt_drain(int device_id) {
         memmove(tbt_pairs[device_id], tbt_pairs[device_id] + drained,
                 tbt_count[device_id] * sizeof(tbt_pair_t));
     }
+    return burst_ns;
 }
 
 static void tbt_push(int device_id, tbt_pair_t pair) {
@@ -364,14 +362,6 @@ static void tbt_push(int device_id, tbt_pair_t pair) {
 
 void time_throttle_pre_launch(CUstream hStream, int device_id) {
     tbt_init_device(device_id);
-    // Drain completed events and stall until budget is non-negative
-    do {
-        tbt_drain(device_id);
-        if (g_cur_cuda_cores[device_id] >= 0) break;
-        tbt_stall_count[device_id]++;
-        nanosleep(&g_cycle, NULL);
-    } while (1);
-    // Create events and record start for this kernel
     cuEventCreate(&tbt_pending[device_id].start, CU_EVENT_DEFAULT);
     cuEventCreate(&tbt_pending[device_id].end, CU_EVENT_DEFAULT);
     cuEventRecord(tbt_pending[device_id].start, hStream);
@@ -380,5 +370,34 @@ void time_throttle_pre_launch(CUstream hStream, int device_id) {
 void time_throttle_post_launch(CUstream hStream, int device_id) {
     cuEventRecord(tbt_pending[device_id].end, hStream);
     tbt_push(device_id, tbt_pending[device_id]);
+}
+
+void time_throttle_sync(int device_id) {
+    if (!tbt_dev_ready[device_id]) return;
+    if (cached_sm_limit[device_id] <= 0 || cached_sm_limit[device_id] >= 100) return;
+
+    // Drain all completed events to measure total GPU time used by this burst.
+    int64_t burst_ns = tbt_drain(device_id);
+    if (burst_ns == 0) return;
+
+    // Debit burst × (1 - limit%) rather than the raw burst time.
+    // A process at limit L should stall for burst × (1-L)/L, which is exactly
+    // what results from debiting burst × (1-L) against a grant rate of L × tick.
+    // This keeps the stall proportional to the limit regardless of burst size.
+    double idle_fraction = 1.0 - cached_sm_limit[device_id] / 100.0;
+    int64_t debit = (int64_t)(burst_ns * idle_fraction);
+    tbt_debited_ns[device_id] += debit;
+
+    int64_t before, after;
+    do {
+        before = g_cur_cuda_cores[device_id];
+        after = before - debit;
+    } while (!CAS(&g_cur_cuda_cores[device_id], before, after));
+
+    // Stall until the watcher has refilled the bucket.
+    while (g_cur_cuda_cores[device_id] < 0) {
+        tbt_stall_count[device_id]++;
+        nanosleep(&g_cycle, NULL);
+    }
 }
 

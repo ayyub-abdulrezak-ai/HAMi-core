@@ -13,7 +13,7 @@ static const struct timespec g_cycle = {
 
 static const struct timespec g_wait = {
     .tv_sec = 0,
-    .tv_nsec = 120 * MILLISEC,
+    .tv_nsec = 30 * MILLISEC,
 };
 
 
@@ -24,3 +24,4 @@ int setspec();
 
 void time_throttle_pre_launch(CUstream hStream, int device_id);
 void time_throttle_post_launch(CUstream hStream, int device_id);
+void time_throttle_sync(int device_id);
