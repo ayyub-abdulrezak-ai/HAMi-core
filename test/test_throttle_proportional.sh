@@ -58,15 +58,16 @@ fi
 [ -f "$BINARY" ] || { echo "ERROR: $BINARY not found. Run make build-in-docker first." >&2; exit 1; }
 [ -f "$LIBVGPU" ] || { echo "ERROR: $LIBVGPU not found." >&2; exit 1; }
 
-# Temp files per process
-OUTS=(); LOGS=(); CACHES=(); PIDS=()
+# Temp files per process — all share one cache so processes register in the same
+# shared region and the watcher can match NVML PIDs to registered processes.
+SHARED_CACHE="/tmp/hami_test_$$.cache"
+OUTS=(); LOGS=(); PIDS=()
 for i in $(seq 1 $N); do
     OUTS+=("/tmp/hami_test_${i}_$$.out")
     LOGS+=("/tmp/hami_test_${i}_$$.log")
-    CACHES+=("/tmp/hami_test_${i}_$$.cache")
 done
 
-cleanup() { rm -f "${OUTS[@]}" "${LOGS[@]}" "${CACHES[@]}"; }
+cleanup() { rm -f "${OUTS[@]}" "${LOGS[@]}" "$SHARED_CACHE"; }
 trap cleanup EXIT
 
 # Build extra env vars for each mode
@@ -91,7 +92,7 @@ for i in $(seq 0 $((N-1))); do
     [ "$MODE" = "none" ] && SM=100
     env LD_PRELOAD="$LIBVGPU" \
         CUDA_DEVICE_SM_LIMIT=$SM \
-        CUDA_DEVICE_MEMORY_SHARED_CACHE="${CACHES[$i]}" \
+        CUDA_DEVICE_MEMORY_SHARED_CACHE="$SHARED_CACHE" \
         LIBCUDA_LOG_LEVEL=$LOG_LEVEL \
         $EXTRA "$BINARY" "$DURATION" > "${OUTS[$i]}" 2>"${LOGS[$i]}" &
     PIDS+=($!)

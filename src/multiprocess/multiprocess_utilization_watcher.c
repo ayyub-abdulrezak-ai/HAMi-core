@@ -45,6 +45,11 @@ static tbt_pair_t  tbt_pending[CUDA_DEVICE_MAX_COUNT];
 static int         tbt_dev_ready[CUDA_DEVICE_MAX_COUNT];
 static int64_t     tbt_stall_count[CUDA_DEVICE_MAX_COUNT];
 static int64_t     tbt_debited_ns[CUDA_DEVICE_MAX_COUNT];
+// Number of competing CUDA processes on this device, updated each watcher tick.
+// cuEventElapsedTime is inflated by N under multi-process time-slicing because
+// other processes' kernels run between our start event and our kernel executing.
+// Dividing burst_ns by N recovers the true per-process GPU compute time.
+static volatile int tbt_process_count[CUDA_DEVICE_MAX_COUNT];
 
 void rate_limiter(int grids, int blocks) {
   CUdevice current_device;
@@ -170,7 +175,7 @@ int get_used_gpu_utilization(int *userutil,int *sysprocnum) {
       cudadev = nvml_to_cuda_map((unsigned int)(devi));
       if (cudadev<0)
         continue;
-      userutil[cudadev] = 0;
+      userutil[cudadev] = -1;  // sentinel: no fresh NVML sample yet this tick
       nvmlDevice_t device;
       CHECK_NVML_API(nvmlDeviceGetHandleByIndex(cudadev, &device));
 
@@ -180,9 +185,10 @@ int get_used_gpu_utilization(int *userutil,int *sysprocnum) {
       //Get Memory for container
       nvmlReturn_t res = nvmlDeviceGetComputeRunningProcesses(device,&infcount,infos);
 
-      // Get SM util for container
+      // Get SM util for container — look back one tick interval so each watcher
+      // tick gets a fresh sample rather than a stale 1-second aggregate.
       gettimeofday(&cur, NULL);
-      microsec = (cur.tv_sec - 1) * 1000UL * 1000UL + cur.tv_usec;
+      microsec = (cur.tv_sec * 1000UL * 1000UL + cur.tv_usec) - g_wait.tv_nsec / 1000UL;
       nvmlProcessUtilizationSample_t processes_sample[SHARED_REGION_MAX_PROCESS_NUM];
       unsigned int processes_num = SHARED_REGION_MAX_PROCESS_NUM;
       nvmlReturn_t res2 = nvmlDeviceGetProcessUtilization(device, processes_sample, &processes_num, microsec);
@@ -199,21 +205,37 @@ int get_used_gpu_utilization(int *userutil,int *sysprocnum) {
         }
       }
 
+      // Use this process's own smUtil rather than the sum across all processes.
+      // The sum is deflated by 1/N under hardware time-slicing, making delta()
+      // compare a device-wide aggregate against a per-process limit — wrong units.
+      // Each process's watcher only needs to know its own utilization vs its own limit.
+      int my_smutil = -1;
+      pid_t my_pid = getpid();
+
+      LOG_INFO("device %d: nvml_sample ts=%zuus n_procs=%u n_samples=%u my_pid=%d\n",
+               cudadev, microsec, infcount, processes_num, my_pid);
       if (res2 == NVML_SUCCESS) {
         for (i=0; i<processes_num; i++){
           proc = find_proc_by_hostpid(processes_sample[i].pid);
+          LOG_INFO("device %d: pid=%u smUtil=%u%% matched=%d\n",
+                   cudadev, processes_sample[i].pid, processes_sample[i].smUtil, proc != NULL);
           if (proc != NULL){
-              sum += processes_sample[i].smUtil;
               proc->device_util[cudadev].sm_util = processes_sample[i].smUtil;
+              if ((pid_t)processes_sample[i].pid == my_pid) {
+                  my_smutil = (int)processes_sample[i].smUtil;
+              }
           }
         }
       }
 
       unlock_shrreg();
 
-      if (sum < 0)
-        sum = 0;
-      userutil[cudadev] = sum;
+      // Only update userutil when NVML actually reported our process this tick.
+      // NVML samples at ~100ms intervals; with a 30ms watcher tick most ticks
+      // won't have a fresh sample.  Passing 0 to delta() when we have no data
+      // causes it to spuriously increase share, so we skip delta() those ticks
+      // by leaving userutil at -1 as a sentinel.
+      userutil[cudadev] = my_smutil;  // -1 if not reported this tick
     }
     return 0;
 }
@@ -232,8 +254,25 @@ void* utilization_watcher() {
 
     ensure_initialized();
 
+    // Allow tick interval to be overridden at runtime for tuning.
+    struct timespec tick = g_wait;
+    const char *tick_env = getenv("HAMI_WATCHER_TICK_MS");
+    if (tick_env != NULL) {
+        long ms = atol(tick_env);
+        if (ms > 0 && ms <= 1000) {
+            tick.tv_nsec = ms * MILLISEC;
+            LOG_MSG("watcher tick overridden to %ldms via HAMI_WATCHER_TICK_MS", ms);
+        }
+    }
+
+    struct timespec tick_start, tick_end;
     while (1){
-        nanosleep(&g_wait, NULL);
+        clock_gettime(CLOCK_MONOTONIC, &tick_start);
+        nanosleep(&tick, NULL);
+        clock_gettime(CLOCK_MONOTONIC, &tick_end);
+        int64_t tick_ms = (tick_end.tv_sec - tick_start.tv_sec) * 1000
+                        + (tick_end.tv_nsec - tick_start.tv_nsec) / 1000000;
+        LOG_INFO("watcher tick: actual_interval=%ldms\n", tick_ms);
         if (pidfound==0) {
           update_host_pid();
           if (pidfound==0)
@@ -251,7 +290,18 @@ void* utilization_watcher() {
             }
 
             if (get_time_based_throttle()) {
-              int64_t tick_ns = g_wait.tv_nsec;
+              // Update competing process count for N-correction of cuEventElapsedTime.
+              unsigned int nprocs = 0;
+              nvmlDevice_t nvml_dev;
+              if (nvmlDeviceGetHandleByIndex(dev, &nvml_dev) == NVML_SUCCESS) {
+                  nvmlProcessInfo_v1_t procs[SHARED_REGION_MAX_PROCESS_NUM];
+                  unsigned int cnt = SHARED_REGION_MAX_PROCESS_NUM;
+                  if (nvmlDeviceGetComputeRunningProcesses(nvml_dev, &cnt, procs) == NVML_SUCCESS)
+                      nprocs = cnt;
+              }
+              tbt_process_count[dev] = (nprocs > 0) ? (int)nprocs : 1;
+
+              int64_t tick_ns = tick.tv_nsec;
               int64_t grant = (int64_t)(cached_sm_limit[dev] / 100.0 * tick_ns);
               change_token(grant, dev);
               int64_t debited = tbt_debited_ns[dev];
@@ -259,17 +309,24 @@ void* utilization_watcher() {
               tbt_debited_ns[dev] = 0;
               tbt_stall_count[dev] = 0;
               int util_pct = grant > 0 ? (int)(debited * 100 / grant) : 0;
-              LOG_INFO("device %d: [time-based] limit=%d%% grant=%ldns debited=%ldns util=%d%% bucket=%ldns pending=%d stalls=%ld\n",
+              LOG_INFO("device %d: [time-based] limit=%d%% grant=%ldns debited=%ldns util=%d%% bucket=%ldns pending=%d stalls=%ld n_procs=%d\n",
                        dev, cached_sm_limit[dev], grant, debited, util_pct,
-                       g_cur_cuda_cores[dev], tbt_count[dev], stalls);
+                       g_cur_cuda_cores[dev], tbt_count[dev], stalls, tbt_process_count[dev]);
             } else {
               if ((share[dev] == g_total_cuda_cores[dev]) && (g_cur_cuda_cores[dev] < 0)) {
                 g_total_cuda_cores[dev] *= 2;
                 share[dev] = g_total_cuda_cores[dev];
               }
 
-              if ((userutil[dev] <= 100) && (userutil[dev] >= 0)) {
-                share[dev] = delta(cached_sm_limit[dev], userutil[dev], share[dev], dev);
+              // Skip delta() when NVML has no sample this tick (userutil=-1), UNLESS
+              // the bucket is negative — a stalled process stops launching kernels so
+              // NVML won't report it, but we need delta() to see 0 and increase share.
+              int effective_util = userutil[dev];
+              if (effective_util < 0) {
+                  effective_util = (g_cur_cuda_cores[dev] < 0) ? 0 : -1;
+              }
+              if ((effective_util <= 100) && (effective_util >= 0)) {
+                share[dev] = delta(cached_sm_limit[dev], effective_util, share[dev], dev);
                 change_token(share[dev], dev);
               }
             }
@@ -317,12 +374,15 @@ static void tbt_init_device(int device_id) {
         tbt_dev_ready[device_id] = 1;
         return;
     }
-    // Cap bucket at one tick period so idle processes don't accumulate burst credit
-    g_total_cuda_cores[device_id] = g_wait.tv_nsec;
+    // Cap bucket at one grant (limit% × tick) so idle processes can't accumulate
+    // more credit than they'd earn in one tick.  Capping at the full tick allows
+    // a process to run ahead of its limit before stalling, causing proportional bias.
+    g_total_cuda_cores[device_id] = (int64_t)(cached_sm_limit[device_id] / 100.0 * g_wait.tv_nsec);
     g_cur_cuda_cores[device_id] = 0;
     tbt_pairs[device_id] = NULL;
     tbt_count[device_id] = 0;
     tbt_cap[device_id] = 0;
+    tbt_process_count[device_id] = 1;
     tbt_dev_ready[device_id] = 1;
 }
 
@@ -362,6 +422,47 @@ static void tbt_push(int device_id, tbt_pair_t pair) {
 
 void time_throttle_pre_launch(CUstream hStream, int device_id) {
     tbt_init_device(device_id);
+
+    // cuEventElapsedTime is inflated by 1/limit_frac because our kernels spend
+    // idle_frac of their elapsed time waiting for other processes.  Multiplying
+    // by limit_frac deflates to true GPU compute; idle_frac then gives the
+    // stall debt that enforces the limit:
+    //   debit = burst × limit_frac × idle_frac
+    double limit_frac = cached_sm_limit[device_id] / 100.0;
+    double idle_frac  = 1.0 - limit_frac;
+    int64_t burst_ns = tbt_drain(device_id);
+    if (burst_ns > 0) {
+        int64_t debit = (int64_t)(burst_ns * limit_frac * idle_frac);
+        tbt_debited_ns[device_id] += debit;
+        LOG_INFO("device %d: [tbt pre_launch] burst=%ldns debit=%ldns bucket_before=%ldns\n",
+                 device_id, burst_ns, debit, g_cur_cuda_cores[device_id]);
+        int64_t before, after;
+        do {
+            before = g_cur_cuda_cores[device_id];
+            after  = before - debit;
+        } while (!CAS(&g_cur_cuda_cores[device_id], before, after));
+    }
+
+    // Stall before submitting the next kernel if the bucket is negative.
+    // Drain on each sleep so events are accounted for while fresh — stale
+    // pending events have inflated elapsed times and must be drained promptly.
+    while (g_cur_cuda_cores[device_id] < 0) {
+        tbt_stall_count[device_id]++;
+        nanosleep(&g_cycle, NULL);
+        int64_t stall_burst = tbt_drain(device_id);
+        if (stall_burst > 0) {
+            int64_t stall_debit = (int64_t)(stall_burst * limit_frac * idle_frac);
+            tbt_debited_ns[device_id] += stall_debit;
+            LOG_INFO("device %d: [tbt stall drain] burst=%ldns debit=%ldns bucket_before=%ldns\n",
+                     device_id, stall_burst, stall_debit, g_cur_cuda_cores[device_id]);
+            int64_t before, after;
+            do {
+                before = g_cur_cuda_cores[device_id];
+                after  = before - stall_debit;
+            } while (!CAS(&g_cur_cuda_cores[device_id], before, after));
+        }
+    }
+
     cuEventCreate(&tbt_pending[device_id].start, CU_EVENT_DEFAULT);
     cuEventCreate(&tbt_pending[device_id].end, CU_EVENT_DEFAULT);
     cuEventRecord(tbt_pending[device_id].start, hStream);
@@ -376,28 +477,22 @@ void time_throttle_sync(int device_id) {
     if (!tbt_dev_ready[device_id]) return;
     if (cached_sm_limit[device_id] <= 0 || cached_sm_limit[device_id] >= 100) return;
 
-    // Drain all completed events to measure total GPU time used by this burst.
+    // Drain and debit any events that completed during this sync.
+    // Same corrected formula: burst × limit_frac × idle_frac.
     int64_t burst_ns = tbt_drain(device_id);
     if (burst_ns == 0) return;
 
-    // Debit burst × (1 - limit%) rather than the raw burst time.
-    // A process at limit L should stall for burst × (1-L)/L, which is exactly
-    // what results from debiting burst × (1-L) against a grant rate of L × tick.
-    // This keeps the stall proportional to the limit regardless of burst size.
-    double idle_fraction = 1.0 - cached_sm_limit[device_id] / 100.0;
-    int64_t debit = (int64_t)(burst_ns * idle_fraction);
+    double limit_frac = cached_sm_limit[device_id] / 100.0;
+    double idle_frac  = 1.0 - limit_frac;
+    int64_t debit = (int64_t)(burst_ns * limit_frac * idle_frac);
     tbt_debited_ns[device_id] += debit;
+    LOG_INFO("device %d: [tbt sync] burst=%ldns debit=%ldns bucket_before=%ldns\n",
+             device_id, burst_ns, debit, g_cur_cuda_cores[device_id]);
 
     int64_t before, after;
     do {
         before = g_cur_cuda_cores[device_id];
-        after = before - debit;
+        after  = before - debit;
     } while (!CAS(&g_cur_cuda_cores[device_id], before, after));
-
-    // Stall until the watcher has refilled the bucket.
-    while (g_cur_cuda_cores[device_id] < 0) {
-        tbt_stall_count[device_id]++;
-        nanosleep(&g_cycle, NULL);
-    }
 }
 

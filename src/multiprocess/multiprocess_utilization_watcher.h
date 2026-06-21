@@ -13,7 +13,7 @@ static const struct timespec g_cycle = {
 
 static const struct timespec g_wait = {
     .tv_sec = 0,
-    .tv_nsec = 30 * MILLISEC,
+    .tv_nsec = 120 * MILLISEC,
 };
 
 
