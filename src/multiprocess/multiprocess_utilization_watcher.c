@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <signal.h>
+#include <pthread.h>
 
 #include <cuda.h>
 #include "include/nvml_prefix.h"
@@ -47,15 +48,13 @@ static int cached_util_switch = 0;
  *   computed_stall = burst_ns * (avg_gpu_frac - limit) / limit   if avg_gpu_frac > limit
  *
  */
-#define TBT_GAMMA 0.95
 
 static int             tbt_dev_ready[CUDA_DEVICE_MAX_COUNT];
 static int             tbt_stall_count[CUDA_DEVICE_MAX_COUNT];
 static volatile int    tbt_process_count[CUDA_DEVICE_MAX_COUNT];
-static double          tbt_total_gpu[CUDA_DEVICE_MAX_COUNT];    // EMA numerator
-static double          tbt_total_wall[CUDA_DEVICE_MAX_COUNT];   // EMA denominator
-static double          tbt_avg_gpu_frac[CUDA_DEVICE_MAX_COUNT]; // cached ratio
 static struct timespec tbt_burst_start[CUDA_DEVICE_MAX_COUNT];  // when last stall ended
+static pthread_mutex_t tbt_mutex[CUDA_DEVICE_MAX_COUNT];        // guards sum_active_fracs + stall_count
+static double          tbt_sum_active_fracs[CUDA_DEVICE_MAX_COUNT]; // written by watcher, read by sync hook
 
 void rate_limiter(int grids, int blocks) {
   CUdevice current_device;
@@ -203,6 +202,9 @@ int get_used_gpu_utilization(int *userutil,int *sysprocnum) {
       lock_shrreg();
 
       if (res == NVML_SUCCESS) {
+        pthread_mutex_lock(&tbt_mutex[cudadev]);
+        tbt_process_count[cudadev] = (int)infcount;
+        pthread_mutex_unlock(&tbt_mutex[cudadev]);
         for (i=0; i<infcount; i++){
           proc = find_proc_by_hostpid(infos[i].pid);
           if (proc != NULL){
@@ -296,22 +298,17 @@ void* utilization_watcher() {
             }
 
             if (get_time_based_throttle()) {
-              // Update EMA of our GPU fraction using NVML smUtil.
-              // userutil[dev] = my_smutil (our process's GPU %, set in get_used_gpu_utilization).
-              // Only update when NVML has a fresh reading (userutil >= 0).
-              if (userutil[dev] >= 0) {
-                  double tick_s = tick.tv_nsec / 1e9;
-                  tbt_total_gpu[dev]  = TBT_GAMMA * tbt_total_gpu[dev]
-                                      + (userutil[dev] / 100.0) * tick_s;
-                  tbt_total_wall[dev] = TBT_GAMMA * tbt_total_wall[dev] + tick_s;
-                  if (tbt_total_wall[dev] > 0)
-                      tbt_avg_gpu_frac[dev] = tbt_total_gpu[dev] / tbt_total_wall[dev];
-              }
-
+              // EMA is driven exclusively from sync boundaries (time_throttle_sync).
+              // The watcher sums active_fracs from shared memory and updates tbt_sum_active_fracs.
+              double sum = tbt_get_sum_active_fracs(dev);
+              pthread_mutex_lock(&tbt_mutex[dev]);
+              tbt_sum_active_fracs[dev] = sum;
               int stalls = tbt_stall_count[dev];
               tbt_stall_count[dev] = 0;
-              LOG_INFO("device %d: [time-based] limit=%d%% avg_gpu=%.1f%% syncs=%d n_procs=%d\n",
-                       dev, cached_sm_limit[dev], tbt_avg_gpu_frac[dev] * 100.0,
+              pthread_mutex_unlock(&tbt_mutex[dev]);
+              LOG_INFO("device %d: [time-based] limit=%d%% sum_active=%.2f target_active=%.1f%% syncs=%d n_procs=%d\n",
+                       dev, cached_sm_limit[dev], sum,
+                       cached_sm_limit[dev] / 100.0 * sum * 100.0,
                        stalls, tbt_process_count[dev]);
             } else {
               if ((share[dev] == g_total_cuda_cores[dev]) && (g_cur_cuda_cores[dev] < 0)) {
@@ -370,17 +367,16 @@ void init_utilization_watcher() {
 
 static void tbt_init_device(int device_id) {
     if (tbt_dev_ready[device_id]) return;
+    pthread_mutex_init(&tbt_mutex[device_id], NULL);
     if (cached_sm_limit[device_id] <= 0 || cached_sm_limit[device_id] >= 100) {
         tbt_dev_ready[device_id] = 1;
         return;
     }
-    // Warmstart: assume we've been running at exactly our limit.
-    double limit_frac = cached_sm_limit[device_id] / 100.0;
-    tbt_total_gpu[device_id]     = limit_frac;
-    tbt_total_wall[device_id]    = 1.0;
-    tbt_avg_gpu_frac[device_id]  = limit_frac;
+    // tbt_sum_active_fracs is intentionally not reset here — the watcher may have
+    // already written a valid sum before the first kernel launch triggers init.
     tbt_stall_count[device_id]   = 0;
     tbt_process_count[device_id] = 1;
+    tbt_set_my_active_frac(device_id, 1.0);
     clock_gettime(CLOCK_MONOTONIC, &tbt_burst_start[device_id]);
     tbt_dev_ready[device_id] = 1;
 }
@@ -408,18 +404,28 @@ void time_throttle_sync(int device_id) {
         return;
     }
 
-    double limit_frac   = cached_sm_limit[device_id] / 100.0;
-    double avg_gpu_frac = tbt_avg_gpu_frac[device_id];
+    double limit_frac = cached_sm_limit[device_id] / 100.0;
 
+    pthread_mutex_lock(&tbt_mutex[device_id]);
+    double sum = tbt_sum_active_fracs[device_id];
+    if (sum < 1.0) sum = 1.0;
+    pthread_mutex_unlock(&tbt_mutex[device_id]);
+
+    // Open-loop stall: target active_frac = limit * sum.
+    // stall = burst * (1/target - 1) = burst * (sum - limit) / (limit * sum)
+    // At convergence: gpu_frac = active_frac / sum = limit. Exact, no EMA bias.
+    double target = limit_frac * sum;
     int64_t stall_ns = 0;
-    if (avg_gpu_frac > limit_frac) {
-        stall_ns = (int64_t)(burst_ns * (avg_gpu_frac - limit_frac) / limit_frac);
+    if (target < 1.0) {
+        stall_ns = (int64_t)(burst_ns * (1.0 - target) / target);
+        pthread_mutex_lock(&tbt_mutex[device_id]);
         tbt_stall_count[device_id]++;
+        pthread_mutex_unlock(&tbt_mutex[device_id]);
     }
 
-    LOG_INFO("device %d: [tbt sync] burst=%ldns stall=%ldns avg_gpu=%.1f%% limit=%d%%\n",
-             device_id, burst_ns, stall_ns, avg_gpu_frac * 100.0,
-             cached_sm_limit[device_id]);
+    LOG_INFO("device %d: [tbt sync] burst=%ldns stall=%ldns target_active=%.1f%% limit=%d%% sum_active=%.2f\n",
+             device_id, burst_ns, stall_ns, target * 100.0,
+             cached_sm_limit[device_id], sum);
 
     if (stall_ns > 0) {
         struct timespec stall_ts = {
@@ -429,17 +435,12 @@ void time_throttle_sync(int device_id) {
         nanosleep(&stall_ts, NULL);
     }
 
-    // Update EMA using CPU-side active fraction: burst / (burst + stall).
-    int64_t cycle_ns = burst_ns + stall_ns;
-    double active_frac = (double)burst_ns / (double)cycle_ns;
+    double active_frac = (double)burst_ns / (double)(burst_ns + stall_ns);
+    tbt_set_my_active_frac(device_id, active_frac);
 
-    tbt_total_gpu[device_id]  = TBT_GAMMA * tbt_total_gpu[device_id]  + active_frac;
-    tbt_total_wall[device_id] = TBT_GAMMA * tbt_total_wall[device_id] + 1.0;
-    tbt_avg_gpu_frac[device_id] = tbt_total_gpu[device_id] / tbt_total_wall[device_id];
-
-    LOG_INFO("device %d: [tbt ema] burst=%ldns stall=%ldns active_frac=%.1f%% avg_gpu=%.1f%% limit=%d%%\n",
+    LOG_INFO("device %d: [tbt stall] burst=%ldns stall=%ldns active_frac=%.1f%% gpu_frac_est=%.1f%% limit=%d%% sum_active=%.2f\n",
              device_id, burst_ns, stall_ns, active_frac * 100.0,
-             tbt_avg_gpu_frac[device_id] * 100.0, cached_sm_limit[device_id]);
+             active_frac / sum * 100.0, cached_sm_limit[device_id], sum);
 
     clock_gettime(CLOCK_MONOTONIC, &tbt_burst_start[device_id]);
 }
