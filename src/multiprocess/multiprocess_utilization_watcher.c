@@ -503,7 +503,12 @@ void time_throttle_pre_launch(CUstream hStream, int device_id) {
     // idle GPU first, maintaining proportionality while keeping the GPU busy.
     if (tbt_all_others_stalling(device_id)) {
         double r = (double)rand_r(&tbt_rand_seed[device_id]) / RAND_MAX;
-        if (r < limit_frac) return;
+        if (r < limit_frac) {
+            // Back-calculation: running instead of stalling counts as spending quota.
+            tbt_stall_debt_ns[device_id] -= chunk;
+            if (tbt_stall_debt_ns[device_id] < 0) tbt_stall_debt_ns[device_id] = 0;
+            return;
+        }
     }
 
     int64_t sleep_ns = chunk;
