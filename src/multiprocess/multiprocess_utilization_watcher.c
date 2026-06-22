@@ -62,6 +62,83 @@ static int             tbt_in_burst[CUDA_DEVICE_MAX_COUNT];
 static struct timespec tbt_burst_start[CUDA_DEVICE_MAX_COUNT];
 static unsigned int    tbt_rand_seed[CUDA_DEVICE_MAX_COUNT];
 static int64_t         tbt_stall_debt_ns[CUDA_DEVICE_MAX_COUNT];  // remaining stall to drip across launches
+
+/* Shared stalling-state mmap: per-process atomic flag visible to all processes
+ * on the same device. Used for work-conserving skip: if all others are stalling,
+ * skip this chunk with probability = limit. */
+#define TBT_STATE_MAX_PROCS 64
+#define TBT_STATE_PATH_FMT  "/tmp/hami_tbt_state_%d.dat"
+
+typedef struct {
+    _Atomic int32_t pid;
+    _Atomic int32_t stalling;
+} tbt_proc_slot_t;
+
+typedef struct {
+    _Atomic int32_t    n_procs;
+    tbt_proc_slot_t    procs[TBT_STATE_MAX_PROCS];
+} tbt_shared_state_t;
+
+static tbt_shared_state_t *tbt_state[CUDA_DEVICE_MAX_COUNT];
+static int                 tbt_my_slot[CUDA_DEVICE_MAX_COUNT];
+
+static void tbt_state_init(int dev) {
+    char path[64];
+    snprintf(path, sizeof(path), TBT_STATE_PATH_FMT, dev);
+    int fd = open(path, O_RDWR | O_CREAT, 0666);
+    if (fd < 0) return;
+    if (ftruncate(fd, sizeof(tbt_shared_state_t)) != 0) { close(fd); return; }
+    tbt_state[dev] = (tbt_shared_state_t *)mmap(NULL, sizeof(tbt_shared_state_t),
+                         PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (tbt_state[dev] == MAP_FAILED) { tbt_state[dev] = NULL; return; }
+
+    pid_t my_pid = getpid();
+    int n = atomic_load(&tbt_state[dev]->n_procs);
+    for (int i = 0; i < n && i < TBT_STATE_MAX_PROCS; i++) {
+        if (atomic_load(&tbt_state[dev]->procs[i].pid) == (int32_t)my_pid) {
+            tbt_my_slot[dev] = i;
+            return;
+        }
+    }
+    int slot = atomic_fetch_add(&tbt_state[dev]->n_procs, 1);
+    if (slot >= TBT_STATE_MAX_PROCS) { slot = TBT_STATE_MAX_PROCS - 1; }
+    atomic_store(&tbt_state[dev]->procs[slot].pid,      (int32_t)my_pid);
+    atomic_store(&tbt_state[dev]->procs[slot].stalling, 0);
+    tbt_my_slot[dev] = slot;
+}
+
+static void tbt_set_stalling(int dev, int val) {
+    if (!tbt_state[dev]) return;
+    atomic_store(&tbt_state[dev]->procs[tbt_my_slot[dev]].stalling, val);
+}
+
+static int tbt_all_others_stalling(int dev) {
+    if (!tbt_state[dev]) return 0;
+    int n = atomic_load(&tbt_state[dev]->n_procs);
+    if (n <= 1) return 0;
+    int my_slot = tbt_my_slot[dev];
+    for (int i = 0; i < n && i < TBT_STATE_MAX_PROCS; i++) {
+        if (i == my_slot) continue;
+        if (atomic_load(&tbt_state[dev]->procs[i].pid) == 0) continue;
+        if (!atomic_load(&tbt_state[dev]->procs[i].stalling)) return 0;
+    }
+    return 1;
+}
+
+void tbt_shared_state_cleanup(void) {
+    pid_t my_pid = getpid();
+    for (int dev = 0; dev < CUDA_DEVICE_MAX_COUNT; dev++) {
+        if (!tbt_state[dev]) continue;
+        int slot = tbt_my_slot[dev];
+        atomic_store(&tbt_state[dev]->procs[slot].stalling, 0);
+        atomic_store(&tbt_state[dev]->procs[slot].pid,      0);
+        atomic_fetch_sub(&tbt_state[dev]->n_procs, 1);
+        (void)my_pid;
+        munmap(tbt_state[dev], sizeof(tbt_shared_state_t));
+        tbt_state[dev] = NULL;
+    }
+}
 static int64_t         tbt_burst_sleep_ns[CUDA_DEVICE_MAX_COUNT]; // sleep already applied during current burst
 
 void rate_limiter(int grids, int blocks) {
@@ -397,6 +474,7 @@ static void tbt_init_device(int device_id) {
     unsigned int base_seed = seed_env ? (unsigned int)atoi(seed_env)
                                       : (unsigned int)(getpid() ^ (unsigned int)time(NULL));
     tbt_rand_seed[device_id] = base_seed ^ (device_id * 2654435761U);
+    tbt_state_init(device_id);
     tbt_set_my_active_frac(device_id, 1.0);
     tbt_dev_ready[device_id] = 1;
 }
@@ -420,16 +498,23 @@ void time_throttle_pre_launch(CUstream hStream, int device_id) {
     if (scaled_chunk < tbt_chunk_ns) scaled_chunk = tbt_chunk_ns;
     int64_t chunk = tbt_stall_debt_ns[device_id] < scaled_chunk
                   ? tbt_stall_debt_ns[device_id] : scaled_chunk;
-    int64_t jitter_range = chunk * tbt_jitter_pct / 100;
-    int64_t jitter = (int64_t)((double)rand_r(&tbt_rand_seed[device_id]) / RAND_MAX * jitter_range * 2) - jitter_range;
-    int64_t sleep_ns = chunk + jitter;
-    if (sleep_ns < 0) sleep_ns = 0;
+    // If all other processes are already stalling (GPU would be idle without us),
+    // skip this chunk with probability = limit. Higher-limit processes fill the
+    // idle GPU first, maintaining proportionality while keeping the GPU busy.
+    if (tbt_all_others_stalling(device_id)) {
+        double r = (double)rand_r(&tbt_rand_seed[device_id]) / RAND_MAX;
+        if (r < limit_frac) return;
+    }
 
+    int64_t sleep_ns = chunk;
+
+    tbt_set_stalling(device_id, 1);
     struct timespec ts = {
         .tv_sec  = sleep_ns / 1000000000LL,
         .tv_nsec = sleep_ns % 1000000000LL,
     };
     nanosleep(&ts, NULL);
+    tbt_set_stalling(device_id, 0);
     tbt_stall_debt_ns[device_id]  -= sleep_ns;
     if (tbt_stall_debt_ns[device_id] < 0) tbt_stall_debt_ns[device_id] = 0;
     tbt_burst_sleep_ns[device_id] += sleep_ns;

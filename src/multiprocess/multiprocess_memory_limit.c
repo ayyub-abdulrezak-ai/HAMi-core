@@ -688,6 +688,7 @@ static inline void copy_proc_slot_atomic(shrreg_proc_slot_t* dst, shrreg_proc_sl
 
 void exit_handler() {
     tbt_cleanup_my_fracs();
+    tbt_shared_state_cleanup();
 
     if (region_info.init_status == PTHREAD_ONCE_INIT) {
         return;
