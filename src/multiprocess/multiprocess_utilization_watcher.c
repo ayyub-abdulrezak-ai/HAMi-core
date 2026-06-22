@@ -55,7 +55,7 @@ static int             tbt_stall_count[CUDA_DEVICE_MAX_COUNT];
 static volatile int    tbt_process_count[CUDA_DEVICE_MAX_COUNT];
 static pthread_mutex_t tbt_mutex[CUDA_DEVICE_MAX_COUNT];        // guards sum_active_fracs + stall_count
 static double          tbt_sum_active_fracs[CUDA_DEVICE_MAX_COUNT]; // written by watcher, read by sync hook
-static int64_t tbt_chunk_ns  = 3000000LL; // default 3ms, overridden by TBT_CHUNK_MS
+static int64_t tbt_chunk_ns  = 2000000LL; // default 2ms, overridden by TBT_CHUNK_MS
 static int     tbt_jitter_pct = 10;         // default ±10%, overridden by TBT_JITTER_PCT
 
 static int             tbt_in_burst[CUDA_DEVICE_MAX_COUNT];
