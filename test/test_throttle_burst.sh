@@ -44,7 +44,7 @@ LIBVGPU="${LIBVGPU:-${SCRIPT_DIR}/../build/libvgpu.so}"
 
 # Absolute throughput tolerance: actual must be >= (1 - ABS_TOLERANCE) * expected.
 # The burst-debit bug produces ~13% of expected, so any reasonable tolerance catches it.
-ABS_TOLERANCE=0.30
+ABS_TOLERANCE=0.20
 
 # Proportional tolerance: share of total output vs share of total limit.
 PROP_TOLERANCE=0.15

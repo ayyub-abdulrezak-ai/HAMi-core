@@ -13,6 +13,7 @@
 #include <time.h>
 #include <signal.h>
 #include <pthread.h>
+#include <math.h>
 
 #include <cuda.h>
 #include "include/nvml_prefix.h"
@@ -54,8 +55,14 @@ static int             tbt_stall_count[CUDA_DEVICE_MAX_COUNT];
 static volatile int    tbt_process_count[CUDA_DEVICE_MAX_COUNT];
 static pthread_mutex_t tbt_mutex[CUDA_DEVICE_MAX_COUNT];        // guards sum_active_fracs + stall_count
 static double          tbt_sum_active_fracs[CUDA_DEVICE_MAX_COUNT]; // written by watcher, read by sync hook
+static int64_t tbt_chunk_ns  = 3000000LL; // default 3ms, overridden by TBT_CHUNK_MS
+static int     tbt_jitter_pct = 10;         // default ±10%, overridden by TBT_JITTER_PCT
+
 static int             tbt_in_burst[CUDA_DEVICE_MAX_COUNT];
-static struct timespec tbt_burst_start[CUDA_DEVICE_MAX_COUNT];  // wall-clock when burst began
+static struct timespec tbt_burst_start[CUDA_DEVICE_MAX_COUNT];
+static unsigned int    tbt_rand_seed[CUDA_DEVICE_MAX_COUNT];
+static int64_t         tbt_stall_debt_ns[CUDA_DEVICE_MAX_COUNT];  // remaining stall to drip across launches
+static int64_t         tbt_burst_sleep_ns[CUDA_DEVICE_MAX_COUNT]; // sleep already applied during current burst
 
 void rate_limiter(int grids, int blocks) {
   CUdevice current_device;
@@ -356,7 +363,13 @@ void init_utilization_watcher() {
         }
     }
 
+    const char *chunk_env = getenv("TBT_CHUNK_MS");
+    if (chunk_env) tbt_chunk_ns = (int64_t)(atof(chunk_env) * 1e6);
+    const char *jitter_env = getenv("TBT_JITTER_PCT");
+    if (jitter_env) tbt_jitter_pct = atoi(jitter_env);
+
     LOG_MSG("throttle mode: %s", get_time_based_throttle() ? "time-based (experimental)" : "NVML-feedback");
+    LOG_MSG("tbt chunk=%.0fms jitter=±%d%%", tbt_chunk_ns / 1e6, tbt_jitter_pct);
 
     pthread_t tid;
     if (has_limit) {
@@ -375,19 +388,55 @@ static void tbt_init_device(int device_id) {
     }
     // tbt_sum_active_fracs is intentionally not reset here — the watcher may have
     // already written a valid sum before the first kernel launch triggers init.
-    tbt_stall_count[device_id]   = 0;
-    tbt_process_count[device_id] = 1;
-    tbt_in_burst[device_id]      = 0;
+    tbt_stall_count[device_id]    = 0;
+    tbt_process_count[device_id]  = 1;
+    tbt_in_burst[device_id]       = 0;
+    tbt_stall_debt_ns[device_id]  = 0;
+    tbt_burst_sleep_ns[device_id] = 0;
+    const char *seed_env = getenv("TBT_RAND_SEED");
+    unsigned int base_seed = seed_env ? (unsigned int)atoi(seed_env)
+                                      : (unsigned int)(getpid() ^ (unsigned int)time(NULL));
+    tbt_rand_seed[device_id] = base_seed ^ (device_id * 2654435761U);
     tbt_set_my_active_frac(device_id, 1.0);
     tbt_dev_ready[device_id] = 1;
 }
 
 void time_throttle_pre_launch(CUstream hStream, int device_id) {
     tbt_init_device(device_id);
+    if (cached_sm_limit[device_id] <= 0 || cached_sm_limit[device_id] >= 100) return;
+
     if (!tbt_in_burst[device_id]) {
         clock_gettime(CLOCK_MONOTONIC, &tbt_burst_start[device_id]);
         tbt_in_burst[device_id] = 1;
     }
+
+    // Drip stall debt in small chunks with small jitter.
+    // Scale chunk by (1-limit)/limit so low-limit processes drain debt at the same
+    // rate as high-limit processes relative to their burst size.
+    if (tbt_stall_debt_ns[device_id] <= 0) return;
+
+    double limit_frac = cached_sm_limit[device_id] / 100.0;
+    int64_t scaled_chunk = (int64_t)(tbt_chunk_ns * log(1.0 / limit_frac));
+    if (scaled_chunk < tbt_chunk_ns) scaled_chunk = tbt_chunk_ns;
+    int64_t chunk = tbt_stall_debt_ns[device_id] < scaled_chunk
+                  ? tbt_stall_debt_ns[device_id] : scaled_chunk;
+    int64_t jitter_range = chunk * tbt_jitter_pct / 100;
+    int64_t jitter = (int64_t)((double)rand_r(&tbt_rand_seed[device_id]) / RAND_MAX * jitter_range * 2) - jitter_range;
+    int64_t sleep_ns = chunk + jitter;
+    if (sleep_ns < 0) sleep_ns = 0;
+
+    struct timespec ts = {
+        .tv_sec  = sleep_ns / 1000000000LL,
+        .tv_nsec = sleep_ns % 1000000000LL,
+    };
+    nanosleep(&ts, NULL);
+    tbt_stall_debt_ns[device_id]  -= sleep_ns;
+    if (tbt_stall_debt_ns[device_id] < 0) tbt_stall_debt_ns[device_id] = 0;
+    tbt_burst_sleep_ns[device_id] += sleep_ns;
+
+    pthread_mutex_lock(&tbt_mutex[device_id]);
+    tbt_stall_count[device_id]++;
+    pthread_mutex_unlock(&tbt_mutex[device_id]);
 }
 
 void time_throttle_post_launch(CUstream hStream, int device_id) {
@@ -411,32 +460,21 @@ void time_throttle_sync(int device_id) {
     pthread_mutex_unlock(&tbt_mutex[device_id]);
     if (sum < 1.0) sum = 1.0;
 
-    // Divide burst by N to estimate actual GPU compute time, removing the
-    // inflation caused by N processes competing under hardware time-slicing.
-    int n_procs = tbt_process_count[device_id];
-    if (n_procs < 1) n_procs = 1;
-    int64_t gpu_burst_ns = burst_ns / n_procs;
-
     double target = limit_frac * sum;
-    int64_t stall_ns = 0;
-    if (target < 1.0 && gpu_burst_ns > 0) {
-        stall_ns = (int64_t)(gpu_burst_ns * (1.0 - target) / target);
-        struct timespec stall_ts = {
-            .tv_sec  = stall_ns / 1000000000LL,
-            .tv_nsec = stall_ns % 1000000000LL,
-        };
-        nanosleep(&stall_ts, NULL);
-        pthread_mutex_lock(&tbt_mutex[device_id]);
-        tbt_stall_count[device_id]++;
-        pthread_mutex_unlock(&tbt_mutex[device_id]);
+    int64_t burst_sleep = tbt_burst_sleep_ns[device_id];
+    if (target < 1.0 && burst_ns > 0) {
+        int64_t net_burst_ns = burst_ns - burst_sleep;
+        if (net_burst_ns > 0)
+            tbt_stall_debt_ns[device_id] += (int64_t)(net_burst_ns * (1.0 - target) / target);
     }
 
     double active_frac = target < 1.0 ? target : 1.0;
     tbt_set_my_active_frac(device_id, active_frac);
-    tbt_in_burst[device_id] = 0;
+    tbt_in_burst[device_id]       = 0;
+    tbt_burst_sleep_ns[device_id] = 0;
 
-    LOG_INFO("device %d: [tbt sync] burst=%ldns gpu_burst=%ldns stall=%ldns target=%.1f%% limit=%d%% n=%d sum_active=%.2f\n",
-             device_id, burst_ns, gpu_burst_ns, stall_ns, target * 100.0,
-             cached_sm_limit[device_id], n_procs, sum);
+    LOG_INFO("device %d: [tbt sync] burst=%ldns sleep=%ldns debt=%ldns target=%.1f%% limit=%d%% sum=%.2f\n",
+             device_id, burst_ns, burst_sleep,
+             tbt_stall_debt_ns[device_id], target * 100.0, cached_sm_limit[device_id], sum);
 }
 

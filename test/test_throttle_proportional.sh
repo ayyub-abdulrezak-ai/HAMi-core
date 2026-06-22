@@ -135,7 +135,7 @@ print_logs() {
 }
 
 # Pass/fail: each process's actual throughput fraction must be within 15% of expected
-TOLERANCE=0.15
+TOLERANCE=0.10
 case "$MODE" in
     none)
         echo "Result: informational (no pass/fail for unthrottled baseline)"
