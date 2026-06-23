@@ -143,6 +143,10 @@ int set_recent_kernel(int value);
 int get_recent_kernel();
 int get_utilization_switch();
 int set_env_utilization_switch();
+int get_experimental_throttler();
+void et_set_my_active_frac(int dev, double frac);
+double et_get_sum_active_fracs(int dev);
+void et_shared_state_cleanup(void);
 
 int set_gpu_device_memory_monitor(int32_t pid,int dev,size_t monitor);
 int set_gpu_device_sm_utilization(int32_t pid,int dev, unsigned int smUtil);

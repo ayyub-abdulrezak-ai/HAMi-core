@@ -21,3 +21,7 @@ void rate_limiter(int grids, int blocks);
 void init_utilization_watcher();
 void* utilization_watcher();
 int setspec();
+
+void et_pre_launch(CUstream hStream, int device_id);
+void et_post_launch(CUstream hStream, int device_id);
+void et_sync(int device_id);

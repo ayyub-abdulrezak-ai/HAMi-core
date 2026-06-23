@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <signal.h>
+#include <dirent.h>
 
 #include <assert.h>
 #include <cuda.h>
@@ -686,6 +687,9 @@ static inline void copy_proc_slot_atomic(shrreg_proc_slot_t* dst, shrreg_proc_sl
 }
 
 void exit_handler() {
+    et_cleanup_my_fracs();
+    et_shared_state_cleanup();
+
     if (region_info.init_status == PTHREAD_ONCE_INIT) {
         return;
     }
@@ -1050,6 +1054,89 @@ int set_env_utilization_switch() {
             return 2;
     }
     return 0;
+}
+
+int get_experimental_throttler() {
+    static int cached = -1;
+    if (cached != -1) return cached;
+    const char *env = getenv("EXPERIMENTAL_THROTTLER");
+    cached = (env != NULL && strcmp(env, "true") == 0) ? 1 : 0;
+    return cached;
+}
+
+/*
+ * TBT active_frac IPC via per-process files in /tmp.
+ *
+ * Each process writes its active_frac for device `dev` to:
+ *   /tmp/hami_et_<pid>_<dev>.dat   (8 bytes, one double)
+ *
+ * The watcher sums all such files to compute the total active_frac across
+ * all competing processes. Dead processes' files are cleaned up on exit.
+ */
+
+static void et_frac_path(char *buf, size_t len, int dev) {
+    snprintf(buf, len, "/tmp/hami_et_%d_%d.dat", (int)getpid(), dev);
+}
+
+void et_set_my_active_frac(int dev, double frac) {
+    char path[64];
+    et_frac_path(path, sizeof(path), dev);
+    int fd = open(path, O_WRONLY | O_CREAT, 0666);
+    if (fd < 0) return;
+    pwrite(fd, &frac, sizeof(frac), 0);
+    close(fd);
+}
+
+double et_get_sum_active_fracs(int dev) {
+    DIR *d = opendir("/tmp");
+    if (!d) return 1.0;
+
+    char prefix[32];
+    snprintf(prefix, sizeof(prefix), "hami_et_");
+    char suffix[16];
+    snprintf(suffix, sizeof(suffix), "_%d.dat", dev);
+
+    double sum = 0.0;
+    int count = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strncmp(ent->d_name, prefix, strlen(prefix)) != 0) continue;
+        if (strstr(ent->d_name, suffix) == NULL) continue;
+
+        /* Extract PID and check process is alive */
+        int pid = atoi(ent->d_name + strlen(prefix));
+        if (pid > 0 && kill((pid_t)pid, 0) != 0) {
+            /* Stale file — dead process, clean up */
+            char path[128];
+            snprintf(path, sizeof(path), "/tmp/%s", ent->d_name);
+            unlink(path);
+            continue;
+        }
+
+        char path[128];
+        snprintf(path, sizeof(path), "/tmp/%s", ent->d_name);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) continue;
+        double frac = 0.0;
+        ssize_t n = pread(fd, &frac, sizeof(frac), 0);
+        close(fd);
+        if (n == sizeof(frac) && frac > 0.0 && frac <= 1.0) {
+            sum += frac;
+            count++;
+        }
+    }
+    closedir(d);
+
+    LOG_DEBUG("et_get_sum_active_fracs dev=%d sum=%.3f count=%d", dev, sum, count);
+    return sum > 0.0 ? sum : 1.0;
+}
+
+void et_cleanup_my_fracs(void) {
+    char path[64];
+    for (int dev = 0; dev < CUDA_DEVICE_MAX_COUNT; dev++) {
+        et_frac_path(path, sizeof(path), dev);
+        unlink(path);
+    }
 }
 
 void try_create_shrreg() {

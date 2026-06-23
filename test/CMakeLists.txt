@@ -19,7 +19,12 @@ foreach(TEST_SCRIPT ${TEST_SCRIPTS})
     endif()
 
     list(APPEND TEST_TARGET_NAMES_LIST ${TEST_TARGET_NAME})
-    target_link_libraries(${TEST_TARGET_NAME}  -lrt -lpthread -lnvidia-ml -lcuda -lcudart -L${CUDA_HOME}/lib64)
+    if (${TEST_TARGET_NAME} STREQUAL "test_cupti_kernel_time" OR ${TEST_TARGET_NAME} STREQUAL "test_cupti_vs_events")
+        target_link_libraries(${TEST_TARGET_NAME}  -lrt -lpthread -lnvidia-ml -lcuda -lcudart -lcupti -L${CUDA_HOME}/lib64 -L${CUDA_HOME}/extras/CUPTI/lib64)
+        target_include_directories(${TEST_TARGET_NAME} PUBLIC ${CUDA_HOME}/extras/CUPTI/include)
+    else()
+        target_link_libraries(${TEST_TARGET_NAME}  -lrt -lpthread -lnvidia-ml -lcuda -lcudart -L${CUDA_HOME}/lib64)
+    endif()
     target_compile_options(${TEST_TARGET_NAME} PUBLIC ${TEST_COMPILE_FLAGS})
 
     if (DEFINED TEST_DEVICE_ID)

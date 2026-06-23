@@ -10,8 +10,8 @@ build-in-docker:
 	docker run -i --rm \
 		-v $(current_dir):/libvgpu \
 		-w /libvgpu \
-		nvidia/cuda:13.3.0-cudnn-devel-ubi8 \
-		sh -c "dnf install -y cmake git && \
+		nvidia/cuda:13.0.0-devel-ubuntu22.04 \
+		sh -c "apt-get update && apt-get install -y cmake git && \
            git config --global --add safe.directory /libvgpu && \
            rm -rf /libvgpu/build && \
            bash ./build.sh"
