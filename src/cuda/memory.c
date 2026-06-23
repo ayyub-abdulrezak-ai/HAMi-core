@@ -5,6 +5,7 @@
 #include "include/libcuda_hook.h"
 #include "include/libvgpu.h"
 #include "include/memory_limit.h"
+#include "multiprocess/multiprocess_utilization_watcher.h"
 
 extern int pidfound;
 
@@ -541,9 +542,18 @@ CUresult cuLaunchKernel ( CUfunction f, unsigned int  gridDimX, unsigned int  gr
     ENSURE_RUNNING();
     ensure_post_init();
     pre_launch_kernel();
-    if (pidfound==1){ 
-        rate_limiter(gridDimX * gridDimY * gridDimZ,
-                   blockDimX * blockDimY * blockDimZ);
+    if (pidfound==1){
+        if (get_time_based_throttle()) {
+            CUdevice current_device;
+            int device_id = (cuCtxGetDevice(&current_device) == CUDA_SUCCESS) ? (int)current_device : 0;
+            time_throttle_pre_launch(hStream, device_id);
+            CUresult res = CUDA_OVERRIDE_CALL(cuda_library_entry,cuLaunchKernel,f,gridDimX,gridDimY,gridDimZ,blockDimX,blockDimY,blockDimZ,sharedMemBytes,hStream,kernelParams,extra);
+            time_throttle_post_launch(hStream, device_id);
+            return res;
+        } else {
+            rate_limiter(gridDimX * gridDimY * gridDimZ,
+                       blockDimX * blockDimY * blockDimZ);
+        }
     }
     CUresult res = CUDA_OVERRIDE_CALL(cuda_library_entry,cuLaunchKernel,f,gridDimX,gridDimY,gridDimZ,blockDimX,blockDimY,blockDimZ,sharedMemBytes,hStream,kernelParams,extra);
     return res;
@@ -554,8 +564,17 @@ CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction f, void **ker
     ensure_post_init();
     pre_launch_kernel();
     if (pidfound==1){
-        rate_limiter(config->gridDimX * config->gridDimY * config->gridDimZ,
-                   config->blockDimX * config->blockDimY * config->blockDimZ);
+        if (get_time_based_throttle()) {
+            CUdevice current_device;
+            int device_id = (cuCtxGetDevice(&current_device) == CUDA_SUCCESS) ? (int)current_device : 0;
+            time_throttle_pre_launch(config->hStream, device_id);
+            CUresult res = CUDA_OVERRIDE_CALL(cuda_library_entry,cuLaunchKernelEx,config,f,kernelParams,extra);
+            time_throttle_post_launch(config->hStream, device_id);
+            return res;
+        } else {
+            rate_limiter(config->gridDimX * config->gridDimY * config->gridDimZ,
+                       config->blockDimX * config->blockDimY * config->blockDimZ);
+        }
     }
     CUresult res = CUDA_OVERRIDE_CALL(cuda_library_entry,cuLaunchKernelEx,config,f,kernelParams,extra);
     return res;

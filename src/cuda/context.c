@@ -1,5 +1,6 @@
 #include "include/libcuda_hook.h"
 #include "multiprocess/multiprocess_memory_limit.h"
+#include "multiprocess/multiprocess_utilization_watcher.h"
 
 extern size_t context_size;
 extern int ctx_activate[16];
@@ -147,6 +148,11 @@ CUresult cuCtxSetSharedMemConfig ( CUsharedconfig config ){
 CUresult cuCtxSynchronize ( void ){
     LOG_DEBUG("INTO CtxSync");
     CUresult res = CUDA_OVERRIDE_CALL(cuda_library_entry,cuCtxSynchronize);
+    if (res == CUDA_SUCCESS && get_time_based_throttle()) {
+        CUdevice current_device;
+        int device_id = (cuCtxGetDevice(&current_device) == CUDA_SUCCESS) ? (int)current_device : 0;
+        time_throttle_sync(device_id);
+    }
     return res;
 }
 
